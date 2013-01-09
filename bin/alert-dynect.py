@@ -10,40 +10,38 @@ import sys
 import time
 try:
     import json
-except ImportError:
-    import simplejson
+except:
+    import simplejson as json
 import threading
 import yaml
 import datetime
 import logging
 import uuid
 import re
-import requests
 from Queue import Queue 
 import socket
+from dynect.DynectDNS import DynectRest
 
 __program__ = 'alert-dynect'
-__version__ = '1.1.1'
+__version__ = '1.1.2'
 
 BROKER_LIST  = [('localhost', 61613)] # list of brokers for failover
 ALERT_QUEUE  = '/queue/alerts'
 GLOBAL_CONF = '/opt/alerta/conf/alerta-global.yaml'
 DEFAULT_TIMEOUT = 86400
-CONFIGFILE = '/opt/alerta/conf/alert-dynect.yaml'
+#CONFIGFILE = '/opt/alerta/conf/alert-dynect.yaml'
 #DISABLE = '/opt/alerta/conf/alert-dynect.disable'
 #LOGFILE = '/var/log/alerta/alert-dynect.log'
 #PIDFILE = '/var/run/alerta/alert-dynect.pid'
-DISABLE = '/home/dnanini/alerta/conf/alert-dynect.disable'
-LOGFILE = '/home/dnanini/alerta/alert-dynect.log'
-PIDFILE = '/home/dnanini/alerta/alert-dynect.pid'
-
+CONFIGFILE = '/home/dnanini/alerta-dmv/conf/alert-dynect.yaml'
+DISABLE = '/home/dnanini/alerta-dmv/conf/alert-dynect.disable'
+LOGFILE = '/home/dnanini/alerta-dmv/alert-dynect.log'
+PIDFILE = '/home/dnanini/alerta-dmv/alert-dynect.pid'
 
 ADDR = '' # in config file ?
 PORT = 29876
 BIND_ADDR = (ADDR,PORT)
 BUFSIZE = 4096
-
-BASE_URL = 'https://api2.dynect.net'
 
 REPEAT_LIMIT = 10
 count = 0
@@ -84,9 +82,8 @@ class QueueThread(threading.Thread):
 
                 queue.task_done()
         except:
-            logging.info('Problem sending alert to %s' % c)
+            logging.info('Problem sending alert. No client ready to receive.' )
             pass
-
 
 class WorkerThread(threading.Thread):
 
@@ -235,40 +232,33 @@ def queryDynect():
 
     global info
 
-    proxies = {}
-
     logging.info('Quering DynECT to get the state of GSLBs')
-
-    if 'proxy' in globalconf:
-        proxies = {"http": globalconf['proxy']['http']}
-
-    headers = {'content-type': 'application/json'}
 
     # Creating DynECT API session 
     try:
 
-        response = requests.post( BASE_URL + '/REST/Session/', data=json.dumps(config), headers=headers, proxies=proxies).json()
+        rest_iface = DynectRest()
+
+        response = rest_iface.execute('/Session/', 'POST', config)
 
         if response['status'] != 'success':
             logging.error('Incorrect credentials')
             sys.exit(1)
 
-        headers['Auth-Token'] = response['data']['token']
-
         # Discover all the Zones in DynECT
-        response = requests.get( BASE_URL +'/REST/Zone/', data=json.dumps(config), headers=headers, proxies=proxies).json()
+        response = rest_iface.execute('/Zone/', 'GET')
         zone_resources = response['data']
 
         # Discover all the LoadBalancers
         for item in zone_resources:
             zone = item.split('/')[3]
-            response = requests.get( BASE_URL +'/REST/LoadBalance/'+zone+'/', data=json.dumps(config), headers=headers, proxies=proxies).json()
+            response = rest_iface.execute('/LoadBalance/'+zone+'/', 'GET')
             gslb = response['data']
 
             # Discover LoadBalancer pool information.
             for lb in gslb:
                 fqdn = lb.split('/')[4]
-                response = requests.get( BASE_URL + '/REST/LoadBalance/'+zone+'/'+fqdn+'/', data=json.dumps(config), headers=headers, proxies=proxies).json()
+                response = rest_iface.execute('/LoadBalance/'+zone+'/'+fqdn+'/', 'GET')
                 info['gslb-'+fqdn] = response['data']['status'], 'gslb-'+fqdn
 
                 for i in response['data']['pool']:
@@ -280,8 +270,7 @@ def queryDynect():
         logging.info('Finish quering and object discovery.')
         logging.info('GSLBs and Pools: %s', json.dumps(info))
 
-        response = requests.delete( BASE_URL + '/REST/Session/', data=json.dumps(config), headers=headers, proxies=proxies).json()
-        headers['Auth-Token'] = None
+        rest_iface.execute('/Session/', 'DELETE')
 
     except Exception, e:
         logging.error('Failed to discover GSLBs: %s', e)
@@ -322,14 +311,6 @@ def main():
         except OSError:
             pass
     file(PIDFILE, 'w').write(str(os.getpid()))
-
-    # Read in global configuration file
-    try:
-        globalconf = yaml.load(open(GLOBAL_CONF))
-        logging.info('Loaded %d global configurations OK', len(globalconf))
-    except Exception,e:
-        logging.warning('Failed to load global configuration: %s. Exit.', e)
-        sys.exit(1)   
 
     # Initialiase config
     init_config()

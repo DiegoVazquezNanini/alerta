@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 ########################################
 #
-# alert-receiver.py - Alert Poller
+# alert-receiver.py - Alert Receiver
 #
 ########################################
 
@@ -25,13 +25,12 @@ __version__ = '1.0.4'
 
 BROKER_LIST  = [('localhost', 61613)] # list of brokers for failover                                                                                                                                                                                                 
 ALERT_QUEUE  = '/queue/alerts'
-BUFSIZE = 1024*8
 #LOGFILE = '/var/log/alerta/alert-receiver.log'
 #PIDFILE = '/var/run/alerta/alert-receiver.pid'
 #CONFFILE = '/opt/alerta/conf/alert-receiver.yaml'
-LOGFILE = '/home/dnanini/alerta/alert-receiver.log'
-PIDFILE = '/home/dnanini/alerta/alert-receiver.pid'
-CONFIGFILE = '/home/dnanini/alerta/conf/alert-receiver.yaml'
+LOGFILE = '/home/dnanini/alerta-dmv/alert-receiver.log'
+PIDFILE = '/home/dnanini/alerta-dmv/alert-receiver.pid'
+CONFIGFILE = '/home/dnanini/alerta-dmv/conf/alert-receiver.yaml'
 
 config = dict()
 sock = list()
@@ -166,18 +165,18 @@ def main():
             for i in ip:
                 buf = ''
                 while True:
-                    print 'about to receive data...'
-                    data = i.recv(BUFSIZE)
-                    print '>>>>>>>'+data
+                    data = i.recv(1)
                     if data == '':
-                        print 'BREAK!!!'
                         break
                     buf += data
-                    print 'data appended'
+                    try:
+                        alerts = json.loads(buf, cls=ConcatJSONDecoder)
+                        break
+                    except:
+                        pass
 
                 if len(buf) > 0:
                     logging.info('Received alert message: %s', buf)
-                    alerts = json.loads(buf, cls=ConcatJSONDecoder)
                     for alert in alerts:
                         headers = dict()
                         headers['type']           = alert['type']
@@ -187,10 +186,6 @@ def main():
                         logging.info('%s : Alert sent to %s:%s', alert['id'], broker[0], str(broker[1]))
                 else:
                     logging.debug('No data!')
-
-            else:
-                data = i.recv(BUFSIZE)
-                logging.info('Received unexpected data: %s', data)
 
             send_heartbeat()
 
