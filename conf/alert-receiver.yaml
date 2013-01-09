@@ -1,0 +1,4 @@
+- host: devmonsvr01
+  port: 29876
+- host: localhost
+  port: 29876

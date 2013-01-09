@@ -14,34 +14,49 @@ except ImportError:
     import simplejson
 import threading
 import yaml
-import stomp
 import datetime
 import logging
 import uuid
 import re
-from BaseHTTPServer import BaseHTTPRequestHandler as BHRH
-from dynect.DynectDNS import DynectRest
+import requests
+from Queue import Queue 
+import socket
 
 __program__ = 'alert-dynect'
-__version__ = '1.0.1'
+__version__ = '1.1.1'
 
 BROKER_LIST  = [('localhost', 61613)] # list of brokers for failover
 ALERT_QUEUE  = '/queue/alerts'
+GLOBAL_CONF = '/opt/alerta/conf/alerta-global.yaml'
 DEFAULT_TIMEOUT = 86400
 CONFIGFILE = '/opt/alerta/conf/alert-dynect.yaml'
-LOGFILE = '/var/log/alerta/alert-dynect.log'
-PIDFILE = '/var/run/alerta/alert-dynect.pid'
-DISABLE = '/opt/alerta/conf/alert-dynect.disable'
+#DISABLE = '/opt/alerta/conf/alert-dynect.disable'
+#LOGFILE = '/var/log/alerta/alert-dynect.log'
+#PIDFILE = '/var/run/alerta/alert-dynect.pid'
+DISABLE = '/home/dnanini/alerta/conf/alert-dynect.disable'
+LOGFILE = '/home/dnanini/alerta/alert-dynect.log'
+PIDFILE = '/home/dnanini/alerta/alert-dynect.pid'
+
+
+ADDR = '' # in config file ?
+PORT = 29876
+BIND_ADDR = (ADDR,PORT)
+BUFSIZE = 4096
+
+BASE_URL = 'https://api2.dynect.net'
 
 REPEAT_LIMIT = 10
 count = 0
 
-_check_rate   = 900             # Check rate of alerts
+_check_rate   = 120             # Check rate of alerts
 
 # Global variables
 config = dict()
 info = dict()
 last = dict()
+globalconf = dict()
+queue = Queue()
+conn = list()
 
 SEVERITY_CODE = {
     # ITU RFC5674 -> Syslog RFC5424
@@ -54,13 +69,32 @@ SEVERITY_CODE = {
     'DEBUG':          7, # Debug
 }
 
+class QueueThread(threading.Thread):
+
+    def __init__(self):
+        threading.Thread.__init__(self)
+
+    def run(self):
+        try:
+            while True:
+                alert = queue.get()
+                for c in conn:
+                    c.sendall(alert)
+                    logging.info('alert sent to %s' % c)
+
+                queue.task_done()
+        except:
+            logging.info('Problem sending alert to %s' % c)
+            pass
+
+
 class WorkerThread(threading.Thread):
 
     def __init__(self):
         threading.Thread.__init__(self)
 
     def run(self):
-        global conn, count, last
+        global count, last
 
         queryDynect()
 
@@ -150,16 +184,8 @@ class WorkerThread(threading.Thread):
 
                 logging.info('%s : %s', alertid, json.dumps(alert))
 
-                while not conn.is_connected():
-                    logging.warning('Waiting for message broker to become available')
-                    time.sleep(30.0)
-
-                try:
-                    conn.send(json.dumps(alert), headers, destination=ALERT_QUEUE)
-                    broker = conn.get_host_and_port()
-                    logging.info('%s : Alert sent to %s:%s', alertid, broker[0], str(broker[1]))
-                except Exception, e:
-                    logging.error('Failed to send alert to broker %s', e)
+                queue.put(json.dumps(alert))
+                logging.info('%s : Alert sent to client' % alertid)
 
         last = info.copy()
 
@@ -168,7 +194,11 @@ class WorkerThread(threading.Thread):
         else:
             count = repeats
 
-        return
+        send_heartbeat()
+
+        # Check the internal queue
+        time.sleep(_check_rate)
+        logging.info('Sleeping for %s secs.' % _check_rate)
 
 # Initialise Config
 def init_config():
@@ -186,7 +216,10 @@ def init_config():
     repeats = config.get('repeats', REPEAT_LIMIT)
     count = repeats
 
+    del config['repeats']
+
     queryDynect()
+
     last = info.copy()
 
 def checkweight(parent, resource):
@@ -202,31 +235,40 @@ def queryDynect():
 
     global info
 
+    proxies = {}
+
     logging.info('Quering DynECT to get the state of GSLBs')
+
+    if 'proxy' in globalconf:
+        proxies = {"http": globalconf['proxy']['http']}
+
+    headers = {'content-type': 'application/json'}
 
     # Creating DynECT API session 
     try:
-        rest_iface = DynectRest()
-        response = rest_iface.execute('/Session/', 'POST', config)
+
+        response = requests.post( BASE_URL + '/REST/Session/', data=json.dumps(config), headers=headers, proxies=proxies).json()
 
         if response['status'] != 'success':
             logging.error('Incorrect credentials')
             sys.exit(1)
 
+        headers['Auth-Token'] = response['data']['token']
+
         # Discover all the Zones in DynECT
-        response = rest_iface.execute('/Zone/', 'GET')
+        response = requests.get( BASE_URL +'/REST/Zone/', data=json.dumps(config), headers=headers, proxies=proxies).json()
         zone_resources = response['data']
 
         # Discover all the LoadBalancers
         for item in zone_resources:
             zone = item.split('/')[3]
-            response = rest_iface.execute('/LoadBalance/'+zone+'/','GET')
+            response = requests.get( BASE_URL +'/REST/LoadBalance/'+zone+'/', data=json.dumps(config), headers=headers, proxies=proxies).json()
             gslb = response['data']
 
             # Discover LoadBalancer pool information.
             for lb in gslb:
                 fqdn = lb.split('/')[4]
-                response = rest_iface.execute('/LoadBalance/'+zone+'/'+fqdn+'/','GET')
+                response = requests.get( BASE_URL + '/REST/LoadBalance/'+zone+'/'+fqdn+'/', data=json.dumps(config), headers=headers, proxies=proxies).json()
                 info['gslb-'+fqdn] = response['data']['status'], 'gslb-'+fqdn
 
                 for i in response['data']['pool']:
@@ -238,27 +280,14 @@ def queryDynect():
         logging.info('Finish quering and object discovery.')
         logging.info('GSLBs and Pools: %s', json.dumps(info))
 
-        rest_iface.execute('/Session/', 'DELETE')
+        response = requests.delete( BASE_URL + '/REST/Session/', data=json.dumps(config), headers=headers, proxies=proxies).json()
+        headers['Auth-Token'] = None
 
     except Exception, e:
         logging.error('Failed to discover GSLBs: %s', e)
         pass
 
-class MessageHandler(object):
-
-    def on_error(self, headers, body):
-        logging.error('Received an error %s', body)
-
-    def on_disconnected(self):
-        global conn
-
-        logging.warning('Connection lost. Attempting auto-reconnect to %s', ALERT_QUEUE)
-        conn.start()
-        conn.connect(wait=True)
-        conn.subscribe(destination=ALERT_QUEUE, ack='auto')
-
 def send_heartbeat():
-    global conn
 
     heartbeatid = str(uuid.uuid4()) # random UUID
     createTime = datetime.datetime.utcnow()
@@ -274,15 +303,11 @@ def send_heartbeat():
     heartbeat['origin']     = "%s/%s" % (__program__,os.uname()[1])
     heartbeat['version']    = __version__
 
-    try:
-        conn.send(json.dumps(heartbeat), headers, destination=ALERT_QUEUE)
-        broker = conn.get_host_and_port()
-        logging.info('%s : Heartbeat sent to %s:%s', heartbeatid, broker[0], str(broker[1]))
-    except Exception, e:
-        logging.error('Failed to send heartbeat to broker %s', e)
+    queue.put(json.dumps(heartbeat))
 
 def main():
-    global config, conn
+
+    global config, conn, globalconf
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s alert-dynect[%(process)d] %(threadName)s %(levelname)s - %(message)s", filename=LOGFILE)
     logging.info('Starting up DynECT GSLB monitor version %s', __version__)
@@ -298,29 +323,33 @@ def main():
             pass
     file(PIDFILE, 'w').write(str(os.getpid()))
 
-    # Connect to message broker
-    logging.info('Connect to broker')
+    # Read in global configuration file
     try:
-        conn = stomp.Connection(
-                   BROKER_LIST,
-                   reconnect_sleep_increase = 5.0,
-                   reconnect_sleep_max = 120.0,
-                   reconnect_attempts_max = 20
-               )
-        conn.set_listener('', MessageHandler())
-        conn.start()
-        conn.connect(wait=True)
-    except Exception, e:
-        logging.error('Stomp connection error: %s', e)
-        sys.exit(1)
+        globalconf = yaml.load(open(GLOBAL_CONF))
+        logging.info('Loaded %d global configurations OK', len(globalconf))
+    except Exception,e:
+        logging.warning('Failed to load global configuration: %s. Exit.', e)
+        sys.exit(1)   
 
     # Initialiase config
     init_config()
     config_mod_time = os.path.getmtime(CONFIGFILE)
 
+    # Initialiase listener
+    serv = socket.socket(socket.AF_INET, socket.SOCK_STREAM )
+    serv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    serv.bind((BIND_ADDR))
+    serv.listen(5)
+
     # Start worker threads
     w = WorkerThread()
-    logging.info('Starting thread: %s', '')
+    w.start()
+    logging.info('Starting Worker thread')
+
+    # Start queue threads 
+    q = QueueThread()
+    q.start()
+    logging.info('Starting Queue thread')
 
     while True:
         try:
@@ -329,13 +358,17 @@ def main():
                 init_config()
                 config_mod_time = os.path.getmtime(CONFIGFILE)
 
-            w.run()
-            send_heartbeat()
-            time.sleep(_check_rate)
+            # Start accept connections
+            logging.info('Waiting for incoming connections')
+            conn_handler, addr = serv.accept()
+            conn.append(conn_handler)
+            logging.info('Accept connection from client %s' % str(addr) )
 
         except (KeyboardInterrupt, SystemExit):
-            conn.disconnect()
+            for conn_handler in conn:
+                conn_handler.close()
             w.join()
+            q.join()
             os.unlink(PIDFILE)
             logging.info('Graceful exit.')
             sys.exit(0)
