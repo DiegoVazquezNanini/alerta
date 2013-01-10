@@ -1,5 +1,5 @@
 # Dynect Config
-customer_name: theguardian
-user_name: websys
-password: Nas2Greast
+customer_name: customer_name
+user_name: username
+password: password
 repeats: 10
