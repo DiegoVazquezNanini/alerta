@@ -23,6 +23,7 @@ import re
 __program__ = 'alert-receiver'
 __version__ = '1.0.4'
 
+
 BROKER_LIST  = [('localhost', 61613)] # list of brokers for failover                                                                                                                                                                                                 
 ALERT_QUEUE  = '/queue/alerts'
 #LOGFILE = '/var/log/alerta/alert-receiver.log'
@@ -160,30 +161,50 @@ def main():
 
             logging.info('Waiting on select ...')
             ip, op, rdy = select.select(sock, [], [])
-            logging.info('Got something! %s %s %s', ip, op, rdy)
+            logging.info('Select finished!')
 
             for i in ip:
+                alerts = list()
                 buf = ''
+                counter = 0
                 while True:
-                    data = i.recv(1)
+                    try:
+                        data = i.recv(1024*4)
+                    except socket.error:
+                        logging.error('Error receiving from server')
+                    logging.info('DATA >>>>%s<<<<', data)
                     if data == '':
+                        logging.debug('Break emtpy buffer')
+                        counter += 1
                         break
                     buf += data
                     try:
                         alerts = json.loads(buf, cls=ConcatJSONDecoder)
+                        logging.info('JSON OK!')
                         break
                     except:
+                        logging.info('JSON BAD!')
                         pass
 
-                if len(buf) > 0:
-                    logging.info('Received alert message: %s', buf)
+                if counter == 3:
+                    logging.error('Server has gone away. Trying reconnecting ...')
+                    disconnect()
+                    connect()
+
+                logging.info('Received %s alerts', len(alerts))
+                if len(alerts) > 0:
+                    logging.info('%s of alerts readed from the buffer', len(alerts))
                     for alert in alerts:
-                        headers = dict()
-                        headers['type']           = alert['type']
-                        headers['correlation-id'] = alert['id']
-                        conn.send(json.dumps(alert), headers, destination=ALERT_QUEUE)
-                        broker = conn.get_host_and_port()
-                        logging.info('%s : Alert sent to %s:%s', alert['id'], broker[0], str(broker[1]))
+                        logging.info('Received alert message: %s', alert)
+                        if 'type' in alert and 'id' in alert:
+                            headers = dict()
+                            headers['type']           = alert['type']
+                            headers['correlation-id'] = alert['id']
+                            conn.send(json.dumps(alert), headers, destination=ALERT_QUEUE)
+                            broker = conn.get_host_and_port()
+                            logging.info('%s : Alert sent to %s:%s', alert['id'], broker[0], str(broker[1]))
+                        else:
+                            logging.error('Skipping malformed alert')
                 else:
                     logging.debug('No data!')
 

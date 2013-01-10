@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/python2.6
 ########################################
 #
 # alert-dynect.py - Alert DynECT Monitor
@@ -23,7 +23,7 @@ import socket
 from dynect.DynectDNS import DynectRest
 
 __program__ = 'alert-dynect'
-__version__ = '1.1.2'
+__version__ = '1.1.3'
 
 BROKER_LIST  = [('localhost', 61613)] # list of brokers for failover
 ALERT_QUEUE  = '/queue/alerts'
@@ -53,7 +53,7 @@ config = dict()
 info = dict()
 last = dict()
 globalconf = dict()
-queue = Queue()
+alert_queue = Queue()
 conn = list()
 
 SEVERITY_CODE = {
@@ -73,17 +73,16 @@ class QueueThread(threading.Thread):
         threading.Thread.__init__(self)
 
     def run(self):
-        try:
-            while True:
-                alert = queue.get()
-                for c in conn:
+        while True:
+            alert = alert_queue.get()
+            for c in conn:
+                try:
                     c.sendall(alert)
+                    logging.info('Sending %s' % alert)
                     logging.info('alert sent to %s' % c)
-
-                queue.task_done()
-        except:
-            logging.info('Problem sending alert. No client ready to receive.' )
-            pass
+                except:
+                    logging.info('Problem sending alert. No client ready to receive.' )
+            alert_queue.task_done()
 
 class WorkerThread(threading.Thread):
 
@@ -93,109 +92,111 @@ class WorkerThread(threading.Thread):
     def run(self):
         global count, last
 
-        queryDynect()
+        while True:
 
-        logging.info('Repeats: %d' % count)
+            queryDynect()
 
-        for item in info:
+            logging.info('Repeats: %d' % count)
 
-            # Defaults
-            resource    = item
-            group       = 'GSLB'
-            value       = info[item][0]
-            environment = [ 'PROD' ]
-            service     = [ 'Network' ]
-            tags        = ''
-            correlate   = ''
-            event       = ''
-            text        = 'Item was %s now it is %s.' % (info[item][0], last[item][0])
+            for item in info:
 
-            if last[item][0] != info[item][0] or count == repeats:
+                # Defaults
+                resource    = item
+                group       = 'GSLB'
+                value       = info[item][0]
+                environment = [ 'PROD' ]
+                service     = [ 'Network' ]
+                tags        = ''
+                correlate   = ''
+                event       = ''
+                text        = 'Item was %s now it is %s.' % (info[item][0], last[item][0])
 
-                if item.startswith('gslb-'):
+                if last[item][0] != info[item][0] or count == repeats:
 
-                    # gslb status       = ok | unk | trouble | failover
+                    if item.startswith('gslb-'):
 
-                    logging.info('GSLB state change from %s to %s' % (info[item][0], last[item][0]))
-                    text = 'GSLB status is %s.' % last[item][0]
+                        # gslb status       = ok | unk | trouble | failover
 
-                    if 'ok' in info[item][0]:
-                        event = 'GslbOK'
-                        severity = 'NORMAL'
-                    else:
-                        event = 'GslbNotOK'
-                        severity = 'CRITICAL'
+                        logging.info('GSLB state change from %s to %s' % (info[item][0], last[item][0]))
+                        text = 'GSLB status is %s.' % last[item][0]
 
-                elif item.startswith('pool-'):
+                        if 'ok' in info[item][0]:
+                            event = 'GslbOK'
+                            severity = 'NORMAL'
+                        else:
+                            event = 'GslbNotOK'
+                            severity = 'CRITICAL'
 
-                    # pool status       = up | unk | down
-                    # pool serve_mode   = obey | always | remove | no
-                    # pool weight	(1-15)
+                    elif item.startswith('pool-'):
 
-                    logging.info('Pool state change from %s to %s' % (info[item][0], last[item][0]))
+                        # pool status       = up | unk | down
+                        # pool serve_mode   = obey | always | remove | no
+                        # pool weight	(1-15)
 
-                    if 'up:obey' in info[item][0] and checkweight(info[item][1], item) == True: 
-                        event = 'PoolUp'
-                        severity = 'NORMAL'
-                        text = 'Pool status is normal'
-                    else:
-                        if 'down' in info[item][0]:
-                            event = 'PoolDown'
-                            severity = 'MAJOR'
-                            text = 'Pool is down'
-                        elif 'obey' not in info[item][0]:
-                            event = 'PoolServe'
-                            severity = 'MAJOR'
-                            text = 'Pool with an incorrect serve mode'
-                        elif checkweight(info[item][1], item) == False:
-                            event = 'PoolWeightError'
-                            severity = 'MINOR'
-                            text = 'Pool with an incorrect weight'
+                        logging.info('Pool state change from %s to %s' % (info[item][0], last[item][0]))
 
-                alertid = str(uuid.uuid4()) # random UUID
-                createTime = datetime.datetime.utcnow()
+                        if 'up:obey' in info[item][0] and checkweight(info[item][1], item) == True: 
+                            event = 'PoolUp'
+                            severity = 'NORMAL'
+                            text = 'Pool status is normal'
+                        else:
+                            if 'down' in info[item][0]:
+                                event = 'PoolDown'
+                                severity = 'MAJOR'
+                                text = 'Pool is down'
+                            elif 'obey' not in info[item][0]:
+                                event = 'PoolServe'
+                                severity = 'MAJOR'
+                                text = 'Pool with an incorrect serve mode'
+                            elif checkweight(info[item][1], item) == False:
+                                event = 'PoolWeightError'
+                                severity = 'MINOR'
+                                text = 'Pool with an incorrect weight'
 
-                headers = dict()
-                headers['type']           = "serviceAlert"
-                headers['correlation-id'] = alertid
+                    alertid = str(uuid.uuid4()) # random UUID
+                    createTime = datetime.datetime.utcnow()
 
-                alert = dict()
-                alert['id']               = alertid
-                alert['resource']         = resource
-                alert['event']            = event
-                alert['group']            = group
-                alert['value']            = value
-                alert['severity']         = severity.upper()
-                alert['severityCode']     = SEVERITY_CODE[alert['severity']]
-                alert['environment']      = environment
-                alert['service']          = service
-                alert['text']             = text
-                alert['type']             = 'dynectAlert'
-                alert['tags']             = tags
-                alert['summary']          = '%s - %s %s is %s on %s %s' % (','.join(environment), severity.upper(), event, value, ','.join(service), resource)
-                alert['createTime']       = createTime.replace(microsecond=0).isoformat() + ".%03dZ" % (createTime.microsecond//1000)
-                alert['origin']           = "%s/%s" % (__program__, os.uname()[1])
-                alert['thresholdInfo']    = 'n/a'
-                alert['timeout']          = DEFAULT_TIMEOUT
-                alert['correlatedEvents'] = correlate
+                    headers = dict()
+                    headers['type']           = "serviceAlert"
+                    headers['correlation-id'] = alertid
 
-                logging.info('%s : %s', alertid, json.dumps(alert))
+                    alert = dict()
+                    alert['id']               = alertid
+                    alert['resource']         = resource
+                    alert['event']            = event
+                    alert['group']            = group
+                    alert['value']            = value
+                    alert['severity']         = severity.upper()
+                    alert['severityCode']     = SEVERITY_CODE[alert['severity']]
+                    alert['environment']      = environment
+                    alert['service']          = service
+                    alert['text']             = text
+                    alert['type']             = 'dynectAlert'
+                    alert['tags']             = tags
+                    alert['summary']          = '%s - %s %s is %s on %s %s' % (','.join(environment), severity.upper(), event, value, ','.join(service), resource)
+                    alert['createTime']       = createTime.replace(microsecond=0).isoformat() + ".%03dZ" % (createTime.microsecond//1000)
+                    alert['origin']           = "%s/%s" % (__program__, os.uname()[1])
+                    alert['thresholdInfo']    = 'n/a'
+                    alert['timeout']          = DEFAULT_TIMEOUT
+                    alert['correlatedEvents'] = correlate
 
-                queue.put(json.dumps(alert))
-                logging.info('%s : Alert sent to client' % alertid)
+                    logging.info('%s : %s', alertid, json.dumps(alert))
 
-        last = info.copy()
+                    alert_queue.put(json.dumps(alert))
+                    logging.info('%s : Alert sent to client' % alertid)
 
-        if count:
-            count -= 1
-        else:
-            count = repeats
+            last = info.copy()
 
-        send_heartbeat()
+            if count:
+                count -= 1
+            else:
+                count = repeats
 
-        # Check the internal queue
-        time.sleep(_check_rate)
-        logging.info('Sleeping for %s secs.' % _check_rate)
+            send_heartbeat()
+
+            # Check the internal queue
+            logging.info('Sleeping for %s secs.' % _check_rate)
+            time.sleep(_check_rate)
 
 # Initialise Config
 def init_config():
@@ -292,7 +293,7 @@ def send_heartbeat():
     heartbeat['origin']     = "%s/%s" % (__program__,os.uname()[1])
     heartbeat['version']    = __version__
 
-    queue.put(json.dumps(heartbeat))
+    alert_queue.put(json.dumps(heartbeat))
 
 def main():
 
